@@ -18,6 +18,8 @@ Options:
 import json
 import sys
 from itertools import groupby
+import time
+import stopit
 
 import docopt
 from deltas.detectors import Detector
@@ -27,6 +29,15 @@ import yamlconf
 
 from .util import op2doc, read_docs
 
+
+class Timer: # From http://preshing.com/20110924/timing-your-code-using-pythons-with-statement/
+    def __enter__(self):
+        self.start = time.clock()
+        return self
+
+    def __exit__(self, *args):
+        self.end = time.clock()
+        self.interval = self.end - self.start
 
 def main(argv=None):
     args = docopt.docopt(__doc__, argv=argv)
@@ -51,6 +62,18 @@ def run(revision_docs, detector, tokenizer, drop_text, verbose):
         json.dump(revision_doc, sys.stdout)
         sys.stdout.write("\n")
 
+def diff(revision_doc, detector, timeout):
+    with stopit.ThreadingTimeout(timeout) as ctx:
+        try:
+            with Timer() as t:
+                operations = detector.diff(last_tokens, tokens)
+        finally:
+            revision_doc['diff_time'] = t.interval
+    if ctx.TIMED_OUT: revision_doc['diff_time'] = -1
+
+    revision_doc['diff'] = [op2doc(op, last_tokens, tokens)
+                            for op in operations]
+
 def json2diffs(revision_docs, detector, tokenizer, verbose):
     
     page_revision_docs = groupby(revision_docs, key=lambda r:r['page']['title'])
@@ -71,7 +94,11 @@ def json2diffs(revision_docs, detector, tokenizer, verbose):
             # Diff detection uses a lot of CPU.  This will be the hottest part
             # of the code.
             if 'diff' not in revision_doc:
-                tokens = tokenizer.tokenize(revision_doc['text'] or "")
+                try:
+                    with Timer() as t:
+                        tokens = tokenizer.tokenize(revision_doc['text'] or "")
+                finally:
+                    revision_doc['tokenize_time'] = t.interval
             else: tokens = []
             last_revision_text = revision_doc['text']
 
