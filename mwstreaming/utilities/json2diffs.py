@@ -6,14 +6,33 @@ revisions were saved (ORDER BY <timestamp> ASC, <id> ASC).
 Produces identical JSON with an additional 'diff' field to <stdout>.  You can
 save space with `--drop-text`.
 
+To help track down performance problems, this command also adds fields
+'tokenize_time' and 'diff_time' to its output, which gives the time
+(in seconds) that it took to run the tokenization and differencing
+algorithms.  Since the differencing algorithm takes quadratic time, it
+can take a long time on some inputs, so it is set to timeout after a
+while. Use the --timeout parameter to control this timeout period (it
+defaults to an hour).  If a timeout occurs, the diff_time field is set to
+-1 to indicate this fact, and the 'diff' field will not be set for the
+record.
+
+To help avoid skew problems, this module also can run in mapper and
+reducer modes.  Given an HDFS input file sorted in the manner
+described above, a streaming map-reduce job can be run using mapper
+mode for the mapper, and reducer mode for the reducer, and the output
+of the job will be as expected.
+
 Usage:
     json2diffs (-h|--help)
-    json2diffs --config=<path> [--drop-text] [--verbose] [--mapper|--reducer]
+    json2diffs [options]
+    json2diffs [options] --mapper
+    json2diffs [options] --reducer
 
 Options:
     --config=<path>    The path to difference detection configuration
     --drop-text        Drops the 'text' field from the JSON blob
     --verbose          Print out progress information
+    --timeout=<secs>   How long to wait for differencing algo [default: 3600]
 """
 import json
 import sys
@@ -45,37 +64,44 @@ def main(argv=None):
     config_doc = yamlconf.load(open(args['--config']))
     detector = Detector.from_config(config_doc, config_doc['detector'])
     tokenizer = Tokenizer.from_config(config_doc, config_doc['tokenizer'])
-    
-    drop_text = bool(args['--drop-text'])
-    verbose = bool(args['--verbose'])
-    ismapper = bool(args['--mapper'])
-    isreducer = bool(args['--reducer'])
-    
-    run(read_docs(sys.stdin), detector, tokenizer, drop_text, verbose)
 
-def run(revision_docs, detector, tokenizer, drop_text, verbose):
-    
-    for revision_doc in json2diffs(revision_docs, detector, tokenizer, verbose):
+    # Parse arguments here, to flag errors back to the user early, but
+    # pass them down via the "args" structure
+    args['drop-text'] = bool(args['--drop-text'])
+    args['verbose'] = bool(args['--verbose'])
+    args['mapper'] = bool(args['--mapper'])
+    args['reducer'] = bool(args['--reducer'])
+    args['timeout'] = int(args['--timeout'])
+
+    run(args, read_docs(sys.stdin), detector, tokenizer)
+
+def run(args, revision_docs, detector, tokenizer):
+    drop_text = args['drop-text']
+
+    for revision_doc in json2diffs(args, revision_docs, detector, tokenizer):
         if drop_text and 'diff' in revision_doc and 'text' in revision_doc:
             del revision_doc['text']
         
         json.dump(revision_doc, sys.stdout)
         sys.stdout.write("\n")
 
-def diff(revision_doc, detector, timeout):
+def diff(revision_doc, detector, last_tokens, tokens, timeout):
     with stopit.ThreadingTimeout(timeout) as ctx:
         try:
             with Timer() as t:
                 operations = detector.diff(last_tokens, tokens)
         finally:
             revision_doc['diff_time'] = t.interval
-    if ctx.TIMED_OUT: revision_doc['diff_time'] = -1
+    if ctx.state == ctx.TIMED_OUT: revision_doc['diff_time'] = -1
+    else: revision_doc['diff'] = [op2doc(op, last_tokens, tokens)
+                                  for op in operations]
 
-    revision_doc['diff'] = [op2doc(op, last_tokens, tokens)
-                            for op in operations]
+def json2diffs(args, revision_docs, detector, tokenizer):
+    verbose = args['verbose']
+    ismapper = args['mapper']
+    isreducer = args['reducer']
+    timeout = args['timeout']
 
-def json2diffs(revision_docs, detector, tokenizer, verbose):
-    
     page_revision_docs = groupby(revision_docs, key=lambda r:r['page']['title'])
     
     first_ever_revision_doc = True
@@ -93,39 +119,35 @@ def json2diffs(revision_docs, detector, tokenizer, verbose):
             
             # Diff detection uses a lot of CPU.  This will be the hottest part
             # of the code.
-            if 'diff' not in revision_doc:
+            if not (isreducer and 'diff' in revision_doc):
                 try:
                     with Timer() as t:
                         tokens = tokenizer.tokenize(revision_doc['text'] or "")
                 finally:
                     revision_doc['tokenize_time'] = t.interval
             else: tokens = []
-            last_revision_text = revision_doc['text']
 
             if isreducer:
                 if first_doc_in_group:
-                    operations = detector.diff(last_tokens, tokens)
-                    revision_doc['diff'] = [op2doc(op, last_tokens, tokens)
-                                            for op in operations]
+                    diff(revision_doc, detector, last_tokens, tokens, timeout)
                 elif 'diff' not in revision_doc:
                     if diff_pending:
-                        operations = detector.diff(last_tokens, tokens)
-                        revision_doc['diff'] = [op2doc(op, last_tokens, tokens)
-                                                for op in operations]
+                        diff(revision_doc,detector,last_tokens,tokens,timeout)
                         diff_pending = False
                     else: diff_pending = True
-
             elif not (ismapper and first_ever_revision_doc):
-                operations = detector.diff(last_tokens, tokens)
-                revision_doc['diff'] = [op2doc(op, last_tokens, tokens)
-                                        for op in operations]
+                diff(revision_doc, detector, last_tokens, tokens, timeout)
             
-            yield revision_doc
+            if 'text' in revision_doc:
+                last_revision_text = revision_doc['text']
+
+            if not diff_pending:
+                yield revision_doc
             
             last_tokens = tokens
             first_ever_revision_doc = False
+            last_revision_doc = revision_doc
             first_doc_in_group = False
-            last_tokens = tokens
         
         
         if verbose: sys.stderr.write("\n")
